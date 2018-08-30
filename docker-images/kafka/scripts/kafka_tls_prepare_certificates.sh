@@ -21,7 +21,12 @@ function create_keystore {
 }
 
 echo "Preparing truststore for replication listener"
-create_truststore /tmp/kafka/cluster.truststore.p12 $CERTS_STORE_PASSWORD /opt/kafka/broker-certs/cluster-ca.crt cluster-ca
+# Add each certificate to the trust store
+for CRT in /opt/kafka/broker-certs/cluster-ca*.crt; do
+  ALIAS=$(basename "$CRT" .crt)
+  echo "Adding $CRT to truststore with alias $ALIAS"
+  create_truststore /tmp/kafka/cluster.truststore.p12 "$CERTS_STORE_PASSWORD" "$CRT" "$ALIAS"
+done
 echo "Preparing truststore for replication listener is complete"
 
 echo "Preparing keystore for replication and clienttls listener"
