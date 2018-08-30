@@ -2,6 +2,9 @@
 
 # path were the Secret with certificates is mounted
 CERTS=/etc/tls-sidecar/certs
+# We need to combine all the cluster-ca certs into one
+COMBINED_CA=/tmp/cluster-ca.crt
+cat ${CERTS}/cluster-ca*.crt > "$COMBINED_CA"
 
 echo "pid = /usr/local/var/run/stunnel.pid"
 echo "foreground = yes"
@@ -10,7 +13,7 @@ echo "debug = info"
 cat <<-EOF
 [zookeeper-2181]
 client = yes
-CAfile = ${CERTS}/cluster-ca.crt
+CAfile = ${COMBINED_CA}
 cert = ${CERTS}/entity-operator.crt
 key = ${CERTS}/entity-operator.key
 accept = 127.0.0.1:2181
