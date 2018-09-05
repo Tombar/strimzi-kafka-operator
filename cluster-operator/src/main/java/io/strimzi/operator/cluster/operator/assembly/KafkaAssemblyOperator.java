@@ -23,6 +23,7 @@ import io.strimzi.certs.CertManager;
 import io.strimzi.certs.SecretCertProvider;
 import io.strimzi.certs.Subject;
 import io.strimzi.operator.cluster.model.AbstractModel;
+import io.strimzi.operator.cluster.model.Certificates;
 import io.strimzi.operator.cluster.model.EntityOperator;
 import io.strimzi.operator.cluster.model.EntityTopicOperator;
 import io.strimzi.operator.cluster.model.EntityUserOperator;
@@ -67,6 +68,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Base64;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -89,6 +91,7 @@ import static java.util.Collections.emptyMap;
  */
 public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesClient, Kafka, KafkaAssemblyList, DoneableKafka, Resource<Kafka, DoneableKafka>> {
     private static final Logger log = LogManager.getLogger(KafkaAssemblyOperator.class.getName());
+
 
     private final long operationTimeoutMs;
 
@@ -130,6 +133,9 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         Future<Void> chainFuture = Future.future();
         new ReconciliationState(reconciliation, kafkaAssembly)
                 .reconcileClusterCa()
+                // Roll everything so the new CA is added to the trust store.
+                .compose(state -> state.rollingUpdateForNewCaCert())
+
                 .compose(state -> state.getZookeeperState())
                 .compose(state -> state.zkScaleDown())
                 .compose(state -> state.zkService())
@@ -201,23 +207,25 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         private final Kafka kafkaAssembly;
         private final Reconciliation reconciliation;
 
-        private List<Secret> assemblySecrets;
+        private Certificates certificates;
+        private boolean clusterCaCertRenewed;
+        private boolean clusterCaCertsRemoved;
 
         private ZookeeperCluster zkCluster;
         private Service zkService;
         private Service zkHeadlessService;
         private ConfigMap zkMetricsAndLogsConfigMap;
         private ReconcileResult<StatefulSet> zkDiffs;
-        private boolean zkForcedRestart;
+        private boolean zkAncillaryCmChange;
 
         private KafkaCluster kafkaCluster = null;
         private Service kafkaService;
         private Service kafkaHeadlessService;
         private ConfigMap kafkaMetricsAndLogsConfigMap;
         private ReconcileResult<StatefulSet> kafkaDiffs;
-        private boolean kafkaForcedRestart;
         private String kafkaExternalBootstrapAddress;
         private SortedMap<Integer, String> kafkaExternalAddresses = new TreeMap<>();
+        private boolean kafkaAncillaryCmChange;
 
         private TopicOperator topicOperator;
         private Deployment toDeployment = null;
@@ -254,13 +262,19 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
                         String clusterCaName = AbstractModel.getClusterCaName(reconciliation.name());
                         List<Secret> clusterSecrets = secretOperations.list(reconciliation.namespace(), caLabels);
                         Secret clusterCa = findSecretWithName(clusterSecrets, clusterCaName);
+                        clusterSecrets.remove(clusterCa);
                         SecretCertProvider secretCertProvider = new SecretCertProvider();
                         Secret secret;
                         X509Certificate currentCert = cert(clusterCa, CLUSTER_CA_CRT);
                         boolean needsRenewal = currentCert != null && certNeedsRenewal(tlsCertificates, currentCert);
+                        if (needsRenewal) {
+                            log.debug("{}: Cluster CA certificate needs to be renewed", reconciliation);
+                        }
+                        final boolean certsRemoved;
                         final Map<String, String> newData;
                         if (tlsCertificates != null && !tlsCertificates.isGenerateCertificateAuthority()) {
                             newData = checkProvidedCert(reconciliation, clusterCaName, clusterCa, currentCert, needsRenewal);
+                            certsRemoved = false;
                         } else {
                             if (clusterCa == null || needsRenewal) {
                                 newData = createOrRenewCert(reconciliation, tlsCertificates, clusterCaName, clusterCa, currentCert);
@@ -268,7 +282,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
                                 log.debug("{}: The cluster CA {} already exists and does not need renewing", reconciliation, clusterCaName);
                                 newData = clusterCa.getData();
                             }
-                            removeExpiredCerts(newData);
+                            certsRemoved = removeExpiredCerts(newData) > 0;
                         }
                         OwnerReference ownerRef = new OwnerReferenceBuilder()
                                 .withApiVersion(kafkaAssembly.getApiVersion())
@@ -284,7 +298,9 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
                         secretOperations.reconcile(reconciliation.namespace(), clusterCaName, secret)
                                 .compose(x -> {
                                     clusterSecrets.add(secret);
-                                    this.assemblySecrets = clusterSecrets;
+                                    this.certificates = new Certificates(certManager, name, clusterSecrets, needsRenewal);
+                                    this.clusterCaCertRenewed = needsRenewal;
+                                    this.clusterCaCertsRemoved = certsRemoved;
                                     future.complete(this);
                                 }, future);
                     } catch (Throwable e) {
@@ -296,7 +312,8 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
             return result;
         }
 
-        private void removeExpiredCerts(Map<String, String> newData) {
+        private int removeExpiredCerts(Map<String, String> newData) {
+            int removed = 0;
             Iterator<String> iter = newData.keySet().iterator();
             while (iter.hasNext()) {
                 Pattern pattern = Pattern.compile("cluster-ca-" + "([0-9T:-]{19}).(crt|key)");
@@ -307,10 +324,13 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
                     String date = matcher.group(1) + "Z";
                     Instant parse = DateTimeFormatter.ISO_DATE_TIME.parse(date, Instant::from);
                     if (parse.isBefore(Instant.now())) {
+                        log.debug("Removing {} from Secret because it has expired", key);
                         iter.remove();
+                        removed++;
                     }
                 }
             }
+            return removed;
         }
 
         private Map<String, String> createOrRenewCert(Reconciliation reconciliation, TlsCertificates tlsCertificates, String clusterCaName, Secret clusterCa, X509Certificate currentCert) throws IOException {
@@ -374,8 +394,10 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         }
 
         private boolean certNeedsRenewal(TlsCertificates tlsCertificates, X509Certificate cert)  {
-            long msTillExpired = cert.getNotAfter().getTime() - System.currentTimeMillis();
-            return msTillExpired / (24L * 60L * 60L * 1000L) < ModelUtils.getRenewalDays(tlsCertificates);
+            Date notAfter = cert.getNotAfter();
+            log.trace("Certificate {} expires on {}", cert.getSubjectDN(), notAfter);
+            long msTillExpired = notAfter.getTime() - System.currentTimeMillis();
+            return msTillExpired < ModelUtils.getRenewalDays(tlsCertificates) * 24L * 60L * 60L * 1000L;
         }
 
         private X509Certificate cert(Secret secret, String key)  {
@@ -402,13 +424,48 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
             }
         }
 
+        Future<ReconciliationState> rollingUpdateForNewCaCert() {
+            if (this.clusterCaCertRenewed || this.clusterCaCertsRemoved) {
+                return zkSetOperations.getAsync(namespace, ZookeeperCluster.zookeeperClusterName(name))
+                        .compose(ss -> {
+                            log.debug("{}: Rolling StatefulSet {} to trust new CA certificate", reconciliation, ss.getMetadata().getName());
+                            return zkSetOperations.maybeRollingUpdate(ss, true);
+                        })
+                        .compose(i -> kafkaSetOperations.getAsync(namespace, KafkaCluster.kafkaClusterName(name)))
+                        .compose(ss -> {
+                            log.debug("{}: Rolling StatefulSet {} to trust new CA certificate", reconciliation, ss.getMetadata().getName());
+                            return kafkaSetOperations.maybeRollingUpdate(ss, true);
+                        })
+                        .compose(i -> {
+                            if (topicOperator != null) {
+                                log.debug("{}: Rolling Deployment {} to trust new CA certificate", reconciliation, TopicOperator.topicOperatorName(name));
+                                return deploymentOperations.rollingUpdate(namespace, TopicOperator.topicOperatorName(name), operationTimeoutMs);
+                            } else {
+                                return Future.succeededFuture();
+                            }
+                        })
+                        .compose(i -> {
+                            if (entityOperator != null) {
+                                log.debug("{}: Rolling Deployment {} to trust new CA certificate", reconciliation, EntityOperator.entityOperatorName(name));
+                                return deploymentOperations.rollingUpdate(namespace, EntityOperator.entityOperatorName(name), operationTimeoutMs);
+                            } else {
+                                return Future.succeededFuture();
+                            }
+                        })
+                        .map(i -> this);
+            } else {
+                return Future.succeededFuture(this);
+            }
+        }
+
+
         Future<ReconciliationState> getZookeeperState() {
             Future<ReconciliationState> fut = Future.future();
 
             vertx.createSharedWorkerExecutor("kubernetes-ops-pool").executeBlocking(
                 future -> {
                     try {
-                        this.zkCluster = ZookeeperCluster.fromCrd(certManager, kafkaAssembly, assemblySecrets);
+                        this.zkCluster = ZookeeperCluster.fromCrd(kafkaAssembly, certificates);
 
                         ConfigMap logAndMetricsConfigMap = zkCluster.generateMetricsAndLogConfigMap(zkCluster.getLogging() instanceof ExternalLogging ?
                                 configMapOperations.get(kafkaAssembly.getMetadata().getNamespace(), ((ExternalLogging) zkCluster.getLogging()).getName()) :
@@ -475,7 +532,23 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         }
 
         Future<ReconciliationState> zkRollingUpdate() {
-            return withVoid(zkSetOperations.maybeRollingUpdate(zkDiffs.resource(), zkForcedRestart));
+            if (log.isDebugEnabled()) {
+                String reason = "";
+                if (clusterCaCertRenewed) {
+                    reason += "cluster CA certificate renewal, ";
+                }
+                if (clusterCaCertsRemoved) {
+                    reason += "cluster CA certificate removal, ";
+                }
+                if (zkAncillaryCmChange) {
+                    reason += "ancillary CM change, ";
+                }
+                if (!reason.isEmpty()) {
+                    log.debug("{}: Rolling ZK SS due to {}", reconciliation, reason.substring(0, reason.length() - 2));
+                }
+            }
+            return withVoid(zkSetOperations.maybeRollingUpdate(zkDiffs.resource(),
+                    zkAncillaryCmChange || clusterCaCertRenewed || clusterCaCertsRemoved));
         }
 
         Future<ReconciliationState> zkScaleUp() {
@@ -492,7 +565,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
 
         Future<ReconciliationState> withZkAncillaryCmChanged(Future<ReconcileResult<ConfigMap>> r) {
             return r.map(rr -> {
-                this.zkForcedRestart = rr instanceof ReconcileResult.Patched;
+                this.zkAncillaryCmChange = rr instanceof ReconcileResult.Patched;
                 return this;
             });
         }
@@ -503,7 +576,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
             vertx.createSharedWorkerExecutor("kubernetes-ops-pool").<ReconciliationState>executeBlocking(
                 future -> {
                     try {
-                        this.kafkaCluster = KafkaCluster.fromCrd(kafkaAssembly);
+                        this.kafkaCluster = KafkaCluster.fromCrd(kafkaAssembly, certificates);
 
                         ConfigMap logAndMetricsConfigMap = kafkaCluster.generateMetricsAndLogConfigMap(
                                 kafkaCluster.getLogging() instanceof ExternalLogging ?
@@ -538,7 +611,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
 
         Future<ReconciliationState> withKafkaAncillaryCmChanged(Future<ReconcileResult<ConfigMap>> r) {
             return r.map(rr -> {
-                this.kafkaForcedRestart = rr instanceof ReconcileResult.Patched;
+                this.kafkaAncillaryCmChange = rr instanceof ReconcileResult.Patched;
                 return this;
             });
         }
@@ -849,9 +922,9 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
 
         Future<ReconciliationState> kafkaGenerateCertificates() {
             if (kafkaCluster.isExposedWithNodePort()) {
-                kafkaCluster.generateCertificates(certManager, kafkaAssembly, assemblySecrets, null, Collections.EMPTY_MAP);
+                kafkaCluster.generateCertificates(kafkaAssembly, certificates, null, Collections.EMPTY_MAP);
             } else  {
-                kafkaCluster.generateCertificates(certManager, kafkaAssembly, assemblySecrets, kafkaExternalBootstrapAddress, kafkaExternalAddresses);
+                kafkaCluster.generateCertificates(kafkaAssembly, certificates, kafkaExternalBootstrapAddress, kafkaExternalAddresses);
             }
             return withVoid(Future.succeededFuture());
         }
@@ -886,7 +959,23 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         }
 
         Future<ReconciliationState> kafkaRollingUpdate() {
-            return withVoid(kafkaSetOperations.maybeRollingUpdate(kafkaDiffs.resource(), kafkaForcedRestart));
+            if (log.isDebugEnabled()) {
+                String reason = "";
+                if (clusterCaCertRenewed) {
+                    reason += "cluster CA certificate renewal, ";
+                }
+                if (clusterCaCertsRemoved) {
+                    reason += "cluster CA certificate removal, ";
+                }
+                if (kafkaAncillaryCmChange) {
+                    reason += "ancillary CM change, ";
+                }
+                if (!reason.isEmpty()) {
+                    log.debug("{}: Rolling Kafka SS due to {}", reconciliation, reason.substring(0, reason.length() - 2));
+                }
+            }
+            return withVoid(kafkaSetOperations.maybeRollingUpdate(kafkaDiffs.resource(),
+                    kafkaAncillaryCmChange || clusterCaCertRenewed || clusterCaCertsRemoved));
         }
 
         Future<ReconciliationState> kafkaScaleUp() {
@@ -907,7 +996,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
             vertx.createSharedWorkerExecutor("kubernetes-ops-pool").<ReconciliationState>executeBlocking(
                 future -> {
                     try {
-                        this.topicOperator = TopicOperator.fromCrd(certManager, kafkaAssembly, assemblySecrets);
+                        this.topicOperator = TopicOperator.fromCrd(kafkaAssembly, certificates);
 
                         if (topicOperator != null) {
                             ConfigMap logAndMetricsConfigMap = topicOperator.generateMetricsAndLogConfigMap(
@@ -960,7 +1049,16 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         }
 
         Future<ReconciliationState> topicOperatorDeployment() {
-            return withVoid(deploymentOperations.reconcile(namespace, TopicOperator.topicOperatorName(name), toDeployment));
+            return withVoid(deploymentOperations.reconcile(namespace, TopicOperator.topicOperatorName(name), toDeployment)
+                .compose(reconcileResult -> {
+                    if (clusterCaCertRenewed && reconcileResult instanceof ReconcileResult.Noop<?>) {
+                        // roll the TO if the cluster CA was renewed and reconcile hasn't rolled it
+                        log.debug("{}: Restarting Topic Operator due to Cluster CA renewal", reconciliation);
+                        return deploymentOperations.rollingUpdate(namespace, TopicOperator.topicOperatorName(name), operationTimeoutMs);
+                    } else {
+                        return Future.succeededFuture();
+                    }
+                }));
         }
 
         Future<ReconciliationState> topicOperatorSecret() {
@@ -973,7 +1071,7 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
             vertx.createSharedWorkerExecutor("kubernetes-ops-pool").<ReconciliationState>executeBlocking(
                 future -> {
                     try {
-                        EntityOperator entityOperator = EntityOperator.fromCrd(certManager, kafkaAssembly, assemblySecrets);
+                        EntityOperator entityOperator = EntityOperator.fromCrd(kafkaAssembly, certificates);
 
                         if (entityOperator != null) {
                             EntityTopicOperator topicOperator = entityOperator.getTopicOperator();
@@ -1054,7 +1152,16 @@ public class KafkaAssemblyOperator extends AbstractAssemblyOperator<KubernetesCl
         }
 
         Future<ReconciliationState> entityOperatorDeployment() {
-            return withVoid(deploymentOperations.reconcile(namespace, EntityOperator.entityOperatorName(name), eoDeployment));
+            return withVoid(deploymentOperations.reconcile(namespace, EntityOperator.entityOperatorName(name), eoDeployment)
+                .compose(reconcileResult -> {
+                    if (clusterCaCertRenewed && reconcileResult instanceof ReconcileResult.Noop<?>) {
+                        // roll the EO if the cluster CA was renewed and reconcile hasn't rolled it
+                        log.debug("{}: Restarting Entity Operator due to Cluster CA renewal", reconciliation);
+                        return deploymentOperations.rollingUpdate(namespace, EntityOperator.entityOperatorName(name), operationTimeoutMs);
+                    } else {
+                        return Future.succeededFuture();
+                    }
+                }));
         }
 
         Future<ReconciliationState> entityOperatorSecret() {

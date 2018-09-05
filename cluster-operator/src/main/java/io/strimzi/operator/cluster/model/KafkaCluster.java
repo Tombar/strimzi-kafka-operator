@@ -50,14 +50,10 @@ import io.strimzi.api.kafka.model.Rack;
 import io.strimzi.api.kafka.model.Resources;
 import io.strimzi.api.kafka.model.Sidecar;
 import io.strimzi.certs.CertAndKey;
-import io.strimzi.certs.CertManager;
-import io.strimzi.certs.Subject;
 import io.strimzi.operator.common.model.Labels;
 import io.strimzi.operator.common.operator.resource.ClusterRoleBindingOperator;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -68,7 +64,6 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
-import static io.strimzi.operator.cluster.model.ModelUtils.findSecretWithName;
 import static java.util.Collections.singletonList;
 
 public class KafkaCluster extends AbstractModel {
@@ -238,7 +233,7 @@ public class KafkaCluster extends AbstractModel {
         return getClusterCaName(cluster) + KafkaCluster.SECRET_CLUSTER_PUBLIC_KEY_SUFFIX;
     }
 
-    public static KafkaCluster fromCrd(Kafka kafkaAssembly) {
+    public static KafkaCluster fromCrd(Kafka kafkaAssembly, Certificates secrets) {
         KafkaCluster result = new KafkaCluster(kafkaAssembly.getMetadata().getNamespace(),
                 kafkaAssembly.getMetadata().getName(),
                 Labels.fromResource(kafkaAssembly).withKind(kafkaAssembly.getKind()));
@@ -296,65 +291,18 @@ public class KafkaCluster extends AbstractModel {
 
     /**
      * Manage certificates generation based on those already present in the Secrets
-     * @param certManager CertManager instance for handling certificates creation
      * @param kafka The kafka CR
-     * @param secrets The Secrets storing certificates
-     * @param externalBootstrapAddress External address to the bootstrap service
-     * @param externalAddresses Map with external addresses under which the individual pods are available
+     * @param certificates The certificates
      */
-    public void generateCertificates(CertManager certManager, Kafka kafka, List<Secret> secrets, String externalBootstrapAddress, Map<Integer, String> externalAddresses) {
+    public void generateCertificates(Kafka kafka, Certificates certificates, String externalBootstrapAddress, Map<Integer, String> externalAddresses) {
         log.debug("Generating certificates");
 
         try {
-            Secret clusterCaSecret = findSecretWithName(secrets, getClusterCaName(cluster));
-            if (clusterCaSecret != null) {
-                // get the generated CA private key + self-signed certificate for each broker
-                clusterCA = new CertAndKey(
-                        decodeFromSecret(clusterCaSecret, "cluster-ca.key"),
-                        decodeFromSecret(clusterCaSecret, "cluster-ca.crt"));
-
-                // CA private key + self-signed certificate for clients communications
-                Secret clientsCaSecret = findSecretWithName(secrets, KafkaCluster.clientsCASecretName(cluster));
-                if (clientsCaSecret == null) {
-                    log.debug("Clients CA to generate");
-                    File clientsCAkeyFile = File.createTempFile("tls", "clients-ca-key");
-                    File clientsCAcertFile = File.createTempFile("tls", "clients-ca-cert");
-
-                    Subject sbj = new Subject();
-                    sbj.setOrganizationName("io.strimzi");
-                    sbj.setCommonName("kafka-clients-ca");
-
-                    certManager.generateSelfSignedCert(clientsCAkeyFile, clientsCAcertFile, sbj, ModelUtils.getCertificateValidity(kafka));
-                    clientsCA =
-                            new CertAndKey(Files.readAllBytes(clientsCAkeyFile.toPath()), Files.readAllBytes(clientsCAcertFile.toPath()));
-                    if (!clientsCAkeyFile.delete()) {
-                        log.warn("{} cannot be deleted", clientsCAkeyFile.getName());
-                    }
-                    if (!clientsCAcertFile.delete()) {
-                        log.warn("{} cannot be deleted", clientsCAcertFile.getName());
-                    }
-                } else {
-                    log.debug("Clients CA already exists");
-                    clientsCA = new CertAndKey(
-                            decodeFromSecret(clientsCaSecret, "clients-ca.key"),
-                            decodeFromSecret(clientsCaSecret, "clients-ca.crt"));
-                }
-
-                // recover or generates the private key + certificate for each broker for internal and clients communication
-                Secret clusterSecret = findSecretWithName(secrets, KafkaCluster.brokersSecretName(cluster));
-
-                int replicasInternalSecret = clusterSecret == null ? 0 : (clusterSecret.getData().size() - 1) / 2;
-
-                log.debug("Internal communication certificates");
-                brokerCerts = maybeCopyOrGenerateCerts(certManager, kafka, clusterSecret, replicasInternalSecret,
-                        clusterCA, KafkaCluster::kafkaPodName, externalBootstrapAddress, externalAddresses);
-
-            } else {
-                throw new NoCertificateSecretException("The cluster CA certificate Secret is missing");
-            }
-
+            clusterCA = certificates.clusterCa();
+            clientsCA = certificates.clientsCa(kafka);
+            brokerCerts = certificates.generateBrokerCerts(kafka, externalBootstrapAddress, externalAddresses);
         } catch (IOException e) {
-            e.printStackTrace();
+            log.warn("Error while generating certificates", e);
         }
 
         log.debug("End generating certificates");
