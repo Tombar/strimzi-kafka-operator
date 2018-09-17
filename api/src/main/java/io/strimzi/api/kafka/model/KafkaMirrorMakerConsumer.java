@@ -18,7 +18,6 @@ import io.fabric8.kubernetes.client.CustomResource;
 import io.strimzi.crdgenerator.annotations.Crd;
 import io.strimzi.crdgenerator.annotations.Description;
 import io.sundr.builder.annotations.Buildable;
-import io.sundr.builder.annotations.BuildableReference;
 import io.sundr.builder.annotations.Inline;
 
 import java.util.HashMap;
@@ -32,45 +31,43 @@ import static java.util.Collections.singletonList;
         using = JsonDeserializer.None.class
 )
 @Crd(
-        apiVersion = KafkaTopic.CRD_API_VERSION,
+        apiVersion = KafkaMirrorMakerConsumer.CRD_API_VERSION,
         spec = @Crd.Spec(
                 names = @Crd.Spec.Names(
-                        kind = KafkaTopic.RESOURCE_KIND,
-                        plural = KafkaTopic.RESOURCE_PLURAL,
-                        shortNames = {KafkaTopic.SHORT_NAME}
+                        kind = KafkaMirrorMakerConsumer.RESOURCE_KIND,
+                        plural = KafkaMirrorMakerConsumer.RESOURCE_PLURAL,
+                        shortNames = {KafkaMirrorMakerConsumer.SHORT_NAME}
                 ),
-                group = KafkaTopic.RESOURCE_GROUP,
+                group = KafkaMirrorMakerConsumer.RESOURCE_GROUP,
                 scope = "Namespaced",
-                version = KafkaTopic.VERSION
+                version = KafkaMirrorMakerConsumer.VERSION
         )
 )
 @Buildable(
         editableEnabled = false,
         generateBuilderPackage = false,
         builderPackage = "io.fabric8.kubernetes.api.builder",
-        inline = @Inline(type = Doneable.class, prefix = "Doneable", value = "done"),
-        refs = {@BuildableReference(ObjectMeta.class)}
+        inline = @Inline(type = Doneable.class, prefix = "Doneable", value = "done")
 )
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonPropertyOrder({"apiVersion", "kind", "metadata", "spec"})
-public class KafkaTopic extends CustomResource {
-
+public class KafkaMirrorMakerConsumer extends CustomResource {
     private static final long serialVersionUID = 1L;
 
     public static final String VERSION = "v1alpha1";
-    public static final String RESOURCE_KIND = "KafkaTopic";
+    public static final String RESOURCE_KIND = "KafkaMirrorMakerConsumer";
     public static final String RESOURCE_LIST_KIND = RESOURCE_KIND + "List";
     public static final String RESOURCE_GROUP = "kafka.strimzi.io";
-    public static final String RESOURCE_PLURAL = "kafkatopics";
-    public static final String RESOURCE_SINGULAR = "kafkatopic";
+    public static final String RESOURCE_PLURAL = "kafkamirrormakerconsumers";
+    public static final String RESOURCE_SINGULAR = "kafkamirrormakerconsumer";
     public static final String CRD_API_VERSION = "apiextensions.k8s.io/v1beta1";
     public static final String CRD_NAME = RESOURCE_PLURAL + "." + RESOURCE_GROUP;
-    public static final String SHORT_NAME = "kt";
+    public static final String SHORT_NAME = "kmmc";
     public static final List<String> RESOURCE_SHORTNAMES = singletonList(SHORT_NAME);
 
     private String apiVersion;
     private ObjectMeta metadata;
-    private KafkaTopicSpec spec;
+    private KafkaMirrorMakerConsumerSpec spec;
     private Map<String, Object> additionalProperties = new HashMap<>(0);
 
     @Override
@@ -93,12 +90,12 @@ public class KafkaTopic extends CustomResource {
         super.setMetadata(metadata);
     }
 
-    @Description("The specification of the topic.")
-    public KafkaTopicSpec getSpec() {
+    @Description("The specification of the user.")
+    public KafkaMirrorMakerConsumerSpec getSpec() {
         return spec;
     }
 
-    public void setSpec(KafkaTopicSpec spec) {
+    public void setSpec(KafkaMirrorMakerConsumerSpec spec) {
         this.spec = spec;
     }
 

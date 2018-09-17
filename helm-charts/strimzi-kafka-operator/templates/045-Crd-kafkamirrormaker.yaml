@@ -1,0 +1,160 @@
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: kafkamirrormakers.kafka.strimzi.io
+  labels:
+    app: '{{ template "strimzi.name" . }}'
+    chart: '{{ template "strimzi.chart" . }}'
+    component: kafkamirrormakers.kafka.strimzi.io-crd
+    release: '{{ .Release.Name }}'
+    heritage: '{{ .Release.Service }}'
+spec:
+  group: kafka.strimzi.io
+  version: v1alpha1
+  scope: Namespaced
+  names:
+    kind: KafkaMirrorMaker
+    listKind: KafkaMirrorMakerList
+    singular: kafkamirrormaker
+    plural: kafkamirrormakers
+    shortNames:
+    - kmm
+  validation:
+    openAPIV3Schema:
+      properties:
+        spec:
+          type: object
+          properties:
+            replicas:
+              type: integer
+              minimum: 1
+            whitelist:
+              type: string
+            blacklist:
+              type: string
+            consumer:
+              type: object
+              properties:
+                spec:
+                  type: object
+                  properties:
+                    authentication:
+                      type: object
+                      properties:
+                        certificateAndKey:
+                          type: object
+                          properties:
+                            certificate:
+                              type: string
+                            key:
+                              type: string
+                            secretName:
+                              type: string
+                          required:
+                          - certificate
+                          - key
+                          - secretName
+                        passwordSecret:
+                          type: object
+                          properties:
+                            password:
+                              type: string
+                            secretName:
+                              type: string
+                          required:
+                          - password
+                          - secretName
+                        type:
+                          type: string
+                        username:
+                          type: string
+                    bootstrapServers:
+                      type: string
+                    config:
+                      type: object
+                    groupId:
+                      type: string
+                    numStreams:
+                      type: integer
+                    tls:
+                      type: object
+                      properties:
+                        trustedCertificates:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              certificate:
+                                type: string
+                              secretName:
+                                type: string
+                            required:
+                            - certificate
+                            - secretName
+                      required:
+                      - trustedCertificates
+                  required:
+                  - groupId
+                  - numStreams
+            producer:
+              type: object
+              properties:
+                spec:
+                  type: object
+                  properties:
+                    authentication:
+                      type: object
+                      properties:
+                        certificateAndKey:
+                          type: object
+                          properties:
+                            certificate:
+                              type: string
+                            key:
+                              type: string
+                            secretName:
+                              type: string
+                          required:
+                          - certificate
+                          - key
+                          - secretName
+                        passwordSecret:
+                          type: object
+                          properties:
+                            password:
+                              type: string
+                            secretName:
+                              type: string
+                          required:
+                          - password
+                          - secretName
+                        type:
+                          type: string
+                        username:
+                          type: string
+                    bootstrapServers:
+                      type: string
+                    config:
+                      type: object
+                    tls:
+                      type: object
+                      properties:
+                        trustedCertificates:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              certificate:
+                                type: string
+                              secretName:
+                                type: string
+                            required:
+                            - certificate
+                            - secretName
+                      required:
+                      - trustedCertificates
+            metrics:
+              type: object
+          required:
+          - replicas
